@@ -34,6 +34,47 @@ async function mpFetch(path, options = {}) {
   return { status: res.status, ok: res.ok, data };
 }
 
+// The optimizer no longer accepts bare card names — it requires card_id, mtgjson_id,
+// or set_code + collector_number. Resolve names via the public singles price list
+// (one row per printing), cached in memory.
+const SINGLES_TTL_MS = 6 * 60 * 60 * 1000;
+let singlesCache = null; // { fetchedAt, byName: Map<lowercased name, rows[]> }
+
+function normaliseName(name) {
+  return name.trim().toLowerCase();
+}
+
+async function loadSingles() {
+  if (singlesCache && Date.now() - singlesCache.fetchedAt < SINGLES_TTL_MS) return singlesCache.byName;
+  const res = await fetch(`${API_BASE}/prices/singles`, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`Failed to load Manapool singles list: ${res.status}`);
+  const { data } = await res.json();
+  const byName = new Map();
+  for (const row of data) {
+    // Index double-faced cards under both the full name and the front face
+    const keys = [normaliseName(row.name)];
+    if (row.name.includes(' // ')) keys.push(normaliseName(row.name.split(' // ')[0]));
+    for (const key of keys) {
+      if (!byName.has(key)) byName.set(key, []);
+      byName.get(key).push(row);
+    }
+  }
+  singlesCache = { fetchedAt: Date.now(), byName };
+  return byName;
+}
+
+// Pick the cheapest in-stock printing for the requested finish.
+// Returns null when the card is unknown or has no listing in that finish.
+async function resolvePrinting(name, foil) {
+  const byName = await loadSingles();
+  const rows = byName.get(normaliseName(name)) || [];
+  const priceKey = foil ? 'price_cents_foil' : 'price_cents';
+  const listed = rows.filter(r => r[priceKey] != null && r.available_quantity > 0);
+  if (listed.length === 0) return null;
+  listed.sort((a, b) => a[priceKey] - b[priceKey]);
+  return listed[0];
+}
+
 // The optimizer streams newline-delimited JSON — parse the final line
 function parseOptimizerResponse(text) {
   const lines = text.trim().split('\n').filter(Boolean);
@@ -44,12 +85,25 @@ function parseOptimizerResponse(text) {
 // Returns { data, unavailable[] } on success, throws on unrecoverable error.
 async function runOptimizer(cards, conditionIds, finishIds) {
   const unavailable = new Set();
-  let remaining = [...cards];
+  const foil = finishIds.includes('FO');
+
+  // Resolve each name to a printing up front; unknown/unlisted names are unavailable
+  const printings = new Map(); // name -> row
+  for (const name of cards) {
+    const row = await resolvePrinting(name, foil);
+    if (row) printings.set(name, row);
+    else unavailable.add(name);
+  }
+  const keyOf = (setCode, number) => `${String(setCode).toUpperCase()}|${number}`;
+  const nameByPrinting = new Map([...printings].map(([name, row]) => [keyOf(row.set_code, row.number), name]));
+
+  let remaining = cards.filter(c => !unavailable.has(c));
 
   while (remaining.length > 0) {
     const cart = remaining.map(name => ({
       type: 'mtg_single',
-      name,
+      set_code: printings.get(name).set_code,
+      collector_number: printings.get(name).number,
       quantity_requested: 1,
       condition_ids: conditionIds,
       finish_ids: finishIds,
@@ -77,10 +131,13 @@ async function runOptimizer(cards, conditionIds, finishIds) {
     if (res.status === 409) {
       let parsed;
       try { parsed = JSON.parse(text); } catch { throw new Error(`Optimizer error 409: ${text.slice(0, 200)}`); }
-      const newlyUnavailable = (parsed.details || []).map(d => d.item?.name).filter(Boolean);
+      const newlyUnavailable = (parsed.details || [])
+        .map(d => nameByPrinting.get(keyOf(d.item?.set_code, d.item?.collector_number))
+          || d.item?.name)
+        .filter(n => remaining.includes(n));
       if (newlyUnavailable.length === 0) throw new Error(`Optimizer 409 with no removable cards: ${text.slice(0, 200)}`);
       newlyUnavailable.forEach(n => unavailable.add(n));
-      remaining = cards.filter(c => !unavailable.has(c));
+      remaining = remaining.filter(c => !unavailable.has(c));
       continue;
     }
 
@@ -203,6 +260,7 @@ async function handleGetAccount() {
     if (status === 200) return JSON.stringify(data, null, 2);
   }
   // If none work, return auth confirmation via a lightweight optimizer call
+  const solRing = await resolvePrinting('Sol Ring', false);
   const testRes = await fetch(`${API_BASE}/buyer/optimizer`, {
     method: 'POST',
     headers: {
@@ -211,7 +269,7 @@ async function handleGetAccount() {
       'X-ManaPool-Access-Token': API_KEY,
       ...(API_EMAIL ? { 'X-ManaPool-Email': API_EMAIL } : {}),
     },
-    body: JSON.stringify({ cart: [{ type: 'mtg_single', name: 'Sol Ring', quantity_requested: 1, condition_ids: ['NM'], finish_ids: ['NF'], language_ids: ['EN'] }] }),
+    body: JSON.stringify({ cart: [{ type: 'mtg_single', set_code: solRing?.set_code, collector_number: solRing?.number, quantity_requested: 1, condition_ids: ['NM'], finish_ids: ['NF'], language_ids: ['EN'] }] }),
   });
   if (testRes.status === 200 || testRes.status === 409) {
     return JSON.stringify({ authenticated: true, email: API_EMAIL, note: 'Auth confirmed via optimizer ping; no dedicated account endpoint found.' }, null, 2);
